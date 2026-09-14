@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Agent Stream Inspector
 // @namespace    https://chatgpt.com/
-// @version      0.4.0
+// @version      0.4.1
 // @description  Passive ChatGPT network inspector with a reconstructed chat/tool timeline.
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -29,7 +29,7 @@
     seq: 0,
     paused: false,
     mode: 'focused',       // focused | all
-    showInternal: true,    // hidden system/context messages in reconstructed chat
+    showInternal: false,   // hidden system/context messages in reconstructed chat
     view: 'split',         // split | chat | events
     filter: '',
     events: [],
@@ -55,6 +55,7 @@
     counts: null,
     healthEl: null,
     healthTimer: null,
+    panelResizeObserver: null,
     renderScheduled: false,
   };
 
@@ -1374,21 +1375,36 @@
         .panel {
           position:fixed; right:12px; top:12px;
           width:min(1180px,calc(100vw - 24px)); height:min(88vh,940px);
+          min-width:min(460px,calc(100vw - 12px)); min-height:min(340px,calc(100vh - 12px));
+          max-width:calc(100vw - 12px); max-height:calc(100vh - 12px);
           display:none; grid-template-rows:auto 1fr;
           color:#ececec; background:#111111f4; border:1px solid #ffffff1c;
           border-radius:16px; overflow:hidden; box-shadow:0 24px 90px #000a;
-          backdrop-filter:blur(28px);
+          backdrop-filter:blur(28px); resize:both;
+          container-type:inline-size; container-name:inspector;
           font:12px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
         }
         .panel.open { display:grid; }
+        .panel::after {
+          content:'↘'; position:absolute; right:4px; bottom:2px; z-index:20;
+          color:#ffffff66; font:11px ui-monospace,SFMono-Regular,monospace;
+          pointer-events:none;
+        }
 
         .topbar {
-          min-height:52px; display:flex; gap:8px; align-items:center; padding:9px 11px;
+          min-height:52px; display:grid;
+          grid-template-columns:minmax(165px,220px) minmax(130px,1fr) auto;
+          gap:8px; align-items:center; padding:9px 11px;
           border-bottom:1px solid #ffffff12; background:#151515e8;
+          cursor:grab; user-select:none;
         }
-        .brand { display:flex; flex-direction:column; min-width:190px; }
+        .topbar.dragging { cursor:grabbing; }
+        .brand { display:flex; flex-direction:column; min-width:0; overflow:hidden; }
+        .brand strong, .brand small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .brand strong { font-size:13px; }
         .brand small { color:#888; font-size:10px; }
+        .toolbar { display:flex; align-items:center; justify-content:flex-end; gap:6px; min-width:0; }
+        .toolbar > * { flex:0 0 auto; }
         .spacer { flex:1; }
 
         .ctl {
@@ -1571,10 +1587,14 @@
 
         .health {
           display:flex; align-items:center; gap:6px; white-space:nowrap;
-          min-width:160px; padding:5px 8px; border:1px solid #ffffff22;
-          border-radius:8px; background:#19191c; color:#c9c9d0;
+          min-width:0; width:100%; max-width:100%; padding:5px 8px;
+          border:1px solid #ffffff22; border-radius:8px;
+          background:#19191c; color:#c9c9d0;
           font:10px ui-monospace,SFMono-Regular,monospace;
+          overflow:hidden;
         }
+        .health-dot { flex:0 0 7px; }
+        .health-text { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
         .health-dot { width:7px; height:7px; border-radius:50%; background:#8b8b94; }
         .health.working .health-dot { background:#69b7ff; box-shadow:0 0 0 4px #69b7ff20; }
         .health.waiting .health-dot { background:#f0bf62; box-shadow:0 0 0 4px #f0bf6220; }
@@ -1622,12 +1642,36 @@
         .asset-grid { display:flex; flex-wrap:wrap; gap:8px; margin-top:7px; color:#bba890; font-size:9px; }
         .asset-grid code { color:#ecd3b4; }
 
-        @media (max-width: 850px) {
-          .panel { width:calc(100vw - 12px); right:6px; top:6px; height:calc(100vh - 12px); }
-          .body { grid-template-columns:1fr; }
-          .body:not(.events-only) .events-pane { display:none; }
-          .topbar { overflow-x:auto; }
-          .brand { min-width:155px; }
+        @container inspector (max-width: 860px) {
+          .topbar { grid-template-columns:minmax(140px,1fr) minmax(120px,1.2fr); }
+          .toolbar {
+            grid-column:1 / -1; justify-content:flex-start;
+            overflow-x:auto; overflow-y:hidden; padding-bottom:2px;
+            scrollbar-width:thin;
+          }
+          .body:not(.chat-only):not(.events-only) {
+            grid-template-columns:1fr;
+            grid-template-rows:minmax(0,1fr) minmax(0,1fr);
+          }
+          .body:not(.chat-only):not(.events-only) .chat-pane {
+            border-right:0; border-bottom:1px solid #ffffff20;
+          }
+        }
+
+        @container inspector (max-width: 560px) {
+          .topbar { grid-template-columns:minmax(0,1fr); }
+          .health, .toolbar { grid-column:1; }
+          .brand small, .pane-sub { display:none; }
+          .pane-head { height:38px; }
+          .event { grid-template-columns:30px 76px minmax(0,1fr); }
+        }
+
+        @media (max-width: 520px), (max-height: 420px) {
+          .panel {
+            right:6px; top:6px;
+            width:calc(100vw - 12px); height:calc(100vh - 12px);
+            min-width:0; min-height:260px;
+          }
         }
       </style>
 
@@ -1640,37 +1684,39 @@
             <small>passive · reconstructed from network only</small>
           </div>
 
-          <label class="toggle">
-            Events
-            <select class="ctl mode">
-              <option value="focused">Focused</option>
-              <option value="all">Everything</option>
-            </select>
-          </label>
-
-          <label class="toggle" title="Show protocol messages ChatGPT marks as visually hidden/internal (system/rebase/context scaffolding).">
-            <input type="checkbox" class="internal-toggle" checked>
-            Show internal
-          </label>
-
-          <label class="toggle">
-            View
-            <select class="ctl view">
-              <option value="split">Split</option>
-              <option value="chat">Chat</option>
-              <option value="events">Events</option>
-            </select>
-          </label>
-
           <div class="health idle" title="Time since the last meaningful protocol update and the last captured network event.">
             <span class="health-dot"></span>
             <span class="health-text">idle · no updates yet</span>
           </div>
-          <span class="spacer"></span>
-          <button class="ctl pause">Pause</button>
-          <button class="ctl clear">Clear</button>
-          <button class="ctl export">Export</button>
-          <button class="ctl close">×</button>
+
+          <div class="toolbar">
+            <label class="toggle">
+              Events
+              <select class="ctl mode">
+                <option value="focused">Focused</option>
+                <option value="all">Everything</option>
+              </select>
+            </label>
+
+            <label class="toggle" title="Show protocol messages ChatGPT marks as visually hidden/internal (system/rebase/context scaffolding).">
+              <input type="checkbox" class="internal-toggle">
+              Show internal
+            </label>
+
+            <label class="toggle">
+              View
+              <select class="ctl view">
+                <option value="split">Split</option>
+                <option value="chat">Chat</option>
+                <option value="events">Events</option>
+              </select>
+            </label>
+
+            <button class="ctl pause">Pause</button>
+            <button class="ctl clear">Clear</button>
+            <button class="ctl export">Export</button>
+            <button class="ctl close">×</button>
+          </div>
         </header>
 
         <main class="body">
@@ -1709,7 +1755,14 @@
     S.healthEl = $('.health');
     if (!S.healthTimer) S.healthTimer = setInterval(updateHealthIndicator, 1000);
 
-    $('.launcher').onclick = () => S.panel.classList.toggle('open');
+    $('.launcher').onclick = () => {
+      const opening = !S.panel.classList.contains('open');
+      S.panel.classList.toggle('open');
+      if (opening) requestAnimationFrame(() => {
+        ensurePanelPositioned();
+        clampPanelToViewport();
+      });
+    };
     $('.close').onclick = () => S.panel.classList.remove('open');
 
     $('.pause').onclick = e => {
@@ -1756,8 +1809,89 @@
 
     $('.export').onclick = exportSnapshot;
 
+    installPanelMovement($('.topbar'));
     updateViewClass();
     scheduleRender();
+  }
+
+  function ensurePanelPositioned() {
+    if (!S.panel || !S.panel.classList.contains('open') || S.panel.dataset.positioned === 'true') return;
+    const rect = S.panel.getBoundingClientRect();
+    S.panel.style.left = `${rect.left}px`;
+    S.panel.style.top = `${rect.top}px`;
+    S.panel.style.right = 'auto';
+    S.panel.style.bottom = 'auto';
+    S.panel.style.width = `${rect.width}px`;
+    S.panel.style.height = `${rect.height}px`;
+    S.panel.dataset.positioned = 'true';
+  }
+
+  function clampPanelToViewport() {
+    if (!S.panel || !S.panel.classList.contains('open')) return;
+    ensurePanelPositioned();
+    const margin = 6;
+    const maxWidth = Math.max(280, window.innerWidth - margin * 2);
+    const maxHeight = Math.max(240, window.innerHeight - margin * 2);
+    let rect = S.panel.getBoundingClientRect();
+
+    if (rect.width > maxWidth) S.panel.style.width = `${maxWidth}px`;
+    if (rect.height > maxHeight) S.panel.style.height = `${maxHeight}px`;
+    rect = S.panel.getBoundingClientRect();
+
+    const maxLeft = Math.max(margin, window.innerWidth - rect.width - margin);
+    const maxTop = Math.max(margin, window.innerHeight - rect.height - margin);
+    S.panel.style.left = `${Math.min(Math.max(margin, rect.left), maxLeft)}px`;
+    S.panel.style.top = `${Math.min(Math.max(margin, rect.top), maxTop)}px`;
+  }
+
+  function installPanelMovement(topbar) {
+    if (!topbar) return;
+    let drag = null;
+    const interactiveSelector = 'button,input,select,label,.health,a,summary,details';
+
+    topbar.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || event.target.closest(interactiveSelector)) return;
+      ensurePanelPositioned();
+      const rect = S.panel.getBoundingClientRect();
+      drag = {
+        id: event.pointerId,
+        dx: event.clientX - rect.left,
+        dy: event.clientY - rect.top,
+      };
+      topbar.setPointerCapture?.(event.pointerId);
+      topbar.classList.add('dragging');
+      event.preventDefault();
+    });
+
+    topbar.addEventListener('pointermove', event => {
+      if (!drag || event.pointerId !== drag.id) return;
+      const margin = 6;
+      const width = S.panel.offsetWidth;
+      const height = S.panel.offsetHeight;
+      const maxLeft = Math.max(margin, window.innerWidth - width - margin);
+      const maxTop = Math.max(margin, window.innerHeight - height - margin);
+      const left = Math.min(Math.max(margin, event.clientX - drag.dx), maxLeft);
+      const top = Math.min(Math.max(margin, event.clientY - drag.dy), maxTop);
+      S.panel.style.left = `${left}px`;
+      S.panel.style.top = `${top}px`;
+    });
+
+    const endDrag = event => {
+      if (!drag || (event?.pointerId != null && event.pointerId !== drag.id)) return;
+      try { topbar.releasePointerCapture?.(drag.id); } catch {}
+      drag = null;
+      topbar.classList.remove('dragging');
+      clampPanelToViewport();
+    };
+
+    topbar.addEventListener('pointerup', endDrag);
+    topbar.addEventListener('pointercancel', endDrag);
+    window.addEventListener('resize', clampPanelToViewport, { passive: true });
+
+    if ('ResizeObserver' in window && !S.panelResizeObserver) {
+      S.panelResizeObserver = new ResizeObserver(() => clampPanelToViewport());
+      S.panelResizeObserver.observe(S.panel);
+    }
   }
 
   function updateViewClass() {
@@ -1845,11 +1979,14 @@
     const parts = [stateLabel];
     if (S.lastActivityAt) parts.push(`activity ${ageText(S.lastActivityAt)}`);
     if (S.lastNetworkAt) parts.push(`net ${ageText(S.lastNetworkAt)}`);
-    if (work.label) parts.push(clip(work.label, 42));
-    text.textContent = parts.join(' · ');
-    S.healthEl.title = work.active
+    if (work.label) parts.push(clip(work.label, 80));
+    const fullStatus = parts.join(' · ');
+    text.textContent = fullStatus;
+    const detail = work.active
       ? `${work.pending.length} tool call(s) awaiting a result; ${work.inProgress.length} message(s) still in progress.`
       : 'No reconstructed message or tool call is currently in progress.';
+    S.healthEl.title = `${fullStatus}
+${detail}`;
   }
 
   function scheduleRender() {
@@ -2241,5 +2378,5 @@
     observer.observe(document, { childList: true, subtree: true });
   }
 
-  console.info('[ChatGPT Agent Stream Inspector] v0.4.0 installed');
+  console.info('[ChatGPT Agent Stream Inspector] v0.4.1 installed');
 })();

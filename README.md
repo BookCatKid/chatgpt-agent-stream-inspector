@@ -46,7 +46,7 @@ The chat pane has first-class renderers for:
 - `model_editable_context`
 - unknown message content, with a structured fallback instead of silently dropping it
 
-**Show internal is enabled by default.** Internal means protocol messages that ChatGPT marks as hidden from the ordinary conversation UI. It does not mean private model chain-of-thought that was never transmitted to the browser.
+**Show internal is off by default.** Enable it when you want protocol messages that ChatGPT marks as hidden from the ordinary conversation UI. Internal does not mean private model chain-of-thought that was never transmitted to the browser.
 
 ### Tools and connectors
 Tool cards understand substantially more than the generic recipient name:
@@ -83,6 +83,13 @@ WAITING · activity 18s · net 2s · Chat On Steroids Core · exec_command
 STALLED? · activity 37s · net 31s
 IDLE · activity 2m 4s · net 9s
 ```
+
+
+### Window layout
+
+The inspector window is draggable from non-interactive parts of the header and resizable from its bottom-right corner. The layout responds to the **inspector width**, not just the browser width: split Chat/Events panes stack vertically when the inspector becomes narrow.
+
+The live health/status region has a stable bounded width and ellipsizes long tool labels instead of reflowing the toolbar. Hover it to see the complete status string and pending-work details.
 
 ## Focused vs Everything
 
@@ -139,6 +146,14 @@ When changing reconstruction logic, test against captures covering ordinary stre
 
 ## Version history
 
+### 0.4.1
+
+- Show internal now defaults off.
+- Draggable and natively resizable inspector window.
+- Container-responsive header and split-pane stacking.
+- Stable, ellipsized health/status area so long tool names cannot shove controls around.
+- Viewport clamping keeps moved/resized windows reachable.
+
 ### 0.4.0
 
 - Major contrast/readability pass.
@@ -148,7 +163,7 @@ When changing reconstruction logic, test against captures covering ordinary stre
 - Dedicated image-generation cards and collapsed model captions.
 - User interruption detection.
 - Live activity/network age indicator.
-- Internal messages remain visible by default.
+- Internal messages can be exposed with Show internal.
 - Unknown payloads keep structured/raw fallbacks rather than disappearing.
 
 ### 0.3.x

@@ -7,8 +7,8 @@ const repo = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..')
 const sourcePath = path.join(repo, 'chatgpt-agent-stream-inspector.user.js');
 let source = fs.readFileSync(sourcePath, 'utf8');
 
-const marker = "  console.info('[ChatGPT Agent Stream Inspector] v0.4.0 installed');";
-assert(source.includes(marker), 'test hook marker not found');
+const marker = /^  console\.info\('\[ChatGPT Agent Stream Inspector\].*$/m;
+assert(marker.test(source), 'test hook marker not found');
 source = source.replace(marker, `  globalThis.__ASI_TEST__ = {
     S, processProtocolData, processWebSocketProtocol,
     describeToolMessage, messageText, findImagePointers
