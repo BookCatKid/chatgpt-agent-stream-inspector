@@ -1,0 +1,4 @@
+.DS_Store
+*.har
+chatgpt-agent-inspector-*.json
+chatgpt-stream-*.json
