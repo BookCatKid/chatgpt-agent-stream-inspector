@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Agent Stream Inspector
 // @namespace    https://chatgpt.com/
-// @version      0.4.1
+// @version      0.4.2
 // @description  Passive ChatGPT network inspector with a reconstructed chat/tool timeline.
 // @match        https://chatgpt.com/*
 // @run-at       document-start
@@ -43,6 +43,8 @@
     lastDeltaTemplate: null,
     markers: new Map(),    // message id -> marker records
     streamMeta: {},
+    activeConversationId: null,
+    activeConversationSource: null,
     lastNetworkAt: null,
     lastActivityAt: null,
     lastActivityKind: null,
@@ -56,6 +58,7 @@
     healthEl: null,
     healthTimer: null,
     panelResizeObserver: null,
+    routeTrackingInstalled: false,
     renderScheduled: false,
   };
 
@@ -67,8 +70,8 @@
     if (S.paused) return;
 
     const now = Date.now();
-    S.lastNetworkAt = now;
-    const lowValue = !!(meta?.transport || meta?.empty || meta?.marker || (meta?.streamPatch && !meta?.meaningfulPatch));
+    if (!meta?.foreignConversation) S.lastNetworkAt = now;
+    const lowValue = !!(meta?.transport || meta?.empty || meta?.marker || meta?.foreignConversation || (meta?.streamPatch && !meta?.meaningfulPatch));
     if (!lowValue) {
       S.lastActivityAt = now;
       S.lastActivityKind = kind;
@@ -92,12 +95,74 @@
     scheduleRender();
   }
 
-  function processProtocolData(data, at) {
+  function normalizeConversationId(value) {
+    return typeof value === 'string' && value.trim() ? value.trim() : null;
+  }
+
+  function payloadConversationIds(value) {
+    const ids = new Set();
+    const visit = item => {
+      if (Array.isArray(item)) {
+        for (const child of item) visit(child);
+        return;
+      }
+      if (!isObj(item)) return;
+      const id = normalizeConversationId(item.conversation_id);
+      if (id) ids.add(id);
+      for (const child of Object.values(item)) visit(child);
+    };
+    visit(value);
+    return [...ids];
+  }
+
+  function protocolConversationId(data) {
+    if (!isObj(data)) return null;
+    return normalizeConversationId(
+      data.conversation_id ||
+      data.v?.conversation_id ||
+      data.payload?.conversation_id ||
+      null
+    );
+  }
+
+  function routeConversationId() {
+    try {
+      const match = String(location.pathname || '').match(/\/c\/([^/?#]+)/);
+      return match ? normalizeConversationId(decodeURIComponent(match[1])) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function setActiveConversation(conversationId, source = 'protocol') {
+    const next = normalizeConversationId(conversationId);
+    if (next === S.activeConversationId) return;
+    S.activeConversationId = next;
+    S.activeConversationSource = source;
+    S.currentRoot = null;
+    S.lastDeltaTemplate = null;
+    scheduleRender();
+    updateHealthIndicator();
+  }
+
+  function recordMatchesActiveConversation(rec) {
+    if (!rec) return false;
+    if (!S.activeConversationId) return !rec.conversationId;
+    return !rec.conversationId || rec.conversationId === S.activeConversationId;
+  }
+
+  function processProtocolData(data, at, sourceURL = '') {
     if (!data || typeof data !== 'object' || Array.isArray(data)) return;
+
+    const packetConversationId = protocolConversationId(data);
+    const mainConversationStream = !sourceURL || String(sourceURL).includes('/backend-api/f/conversation');
+    if (mainConversationStream && packetConversationId) {
+      setActiveConversation(packetConversationId, 'sse');
+    }
 
     // Explicit duplicated input message. Dedupe happens by id.
     if (data.type === 'input_message' && isObj(data.input_message)) {
-      upsertMessage(data.input_message, at);
+      upsertMessage(data.input_message, at, packetConversationId || S.activeConversationId);
       return;
     }
 
@@ -122,7 +187,7 @@
     if (isObj(data.v) && isObj(data.v.message)) {
       S.currentRoot = deepClone(data.v);
       S.lastDeltaTemplate = null;
-      upsertMessage(S.currentRoot.message, at);
+      upsertMessage(S.currentRoot.message, at, normalizeConversationId(S.currentRoot.conversation_id) || S.activeConversationId);
       return;
     }
 
@@ -160,7 +225,7 @@
     try {
       S.currentRoot = applyDeltaOperation(S.currentRoot, operation);
       if (isObj(S.currentRoot) && isObj(S.currentRoot.message)) {
-        upsertMessage(S.currentRoot.message, at);
+        upsertMessage(S.currentRoot.message, at, normalizeConversationId(S.currentRoot.conversation_id) || S.activeConversationId);
       }
     } catch (err) {
       emit(
@@ -172,8 +237,10 @@
     }
   }
 
-  function upsertMessage(message, at) {
+  function upsertMessage(message, at, conversationId = null) {
     if (!isObj(message) || !message.id) return;
+
+    const scopedConversationId = normalizeConversationId(conversationId);
 
     const id = message.id;
     const existing = S.messages.get(id);
@@ -184,11 +251,13 @@
         firstSeen: at || new Date().toISOString(),
         lastSeen: at || new Date().toISOString(),
         order: ++S.messageOrderCounter,
+        conversationId: scopedConversationId,
       });
       S.messageOrder.push(id);
     } else {
       existing.message = deepClone(message);
       existing.lastSeen = at || new Date().toISOString();
+      if (scopedConversationId) existing.conversationId = scopedConversationId;
     }
   }
 
@@ -447,7 +516,7 @@
     let data = text;
     try { data = JSON.parse(text); } catch {}
 
-    processProtocolData(data, new Date().toISOString());
+    processProtocolData(data, new Date().toISOString(), url);
 
     const c = classify(data, text);
     emit(
@@ -486,12 +555,15 @@
           processWebSocketProtocol(payload, new Date().toISOString());
 
           const transportOnly = isWSHandshake(payload);
+          const conversationIds = payloadConversationIds(payload);
+          const foreignOnly = conversationIds.length > 0 &&
+            (!S.activeConversationId || conversationIds.every(id => id !== S.activeConversationId));
           emit(
             'WS:IN',
-            `${shortURL(url)} ${summarize(payload)}`,
+            `${shortURL(url)} ${foreignOnly ? '[other chat] ' : ''}${summarize(payload)}`,
             payload,
             'ws',
-            { transport: transportOnly }
+            { transport: transportOnly, foreignConversation: foreignOnly, conversationIds }
           );
         });
 
@@ -539,20 +611,25 @@
       if (value.type === 'conversation-update') {
         const update = value.payload || {};
         const content = update.update_content || {};
+        const conversationId = normalizeConversationId(update.conversation_id);
 
-        // Different conversation-update variants use either a singular
-        // `message` or an array of `messages`. Image generation and other
-        // async work rely heavily on the plural form.
+        // The conversations WebSocket is global to the account. It can deliver
+        // async updates for chats other than the one currently open. Keep those
+        // records scoped to their own conversation so Network Chat never leaks
+        // image/tool messages across chats; the raw WS event still stays in Events.
         const messages = [];
         if (isObj(content.message)) messages.push(content.message);
         if (Array.isArray(content.messages)) messages.push(...content.messages);
         for (const message of messages) {
-          if (isObj(message) && message.id) upsertMessage(message, at);
+          if (isObj(message) && message.id) upsertMessage(message, at, conversationId);
         }
 
-        // Preserve async state changes so the health indicator can explain
-        // when ChatGPT has handed work off to an asynchronous worker.
-        if (update.update_type === 'set-conversation-async-status') {
+        // Foreign-conversation async status must not make the current chat look
+        // busy or stalled.
+        if (
+          update.update_type === 'set-conversation-async-status' &&
+          (!conversationId || conversationId === S.activeConversationId)
+        ) {
           S.streamMeta.conversation_async_status = deepClone(content.conversation_async_status ?? content);
           S.lastActivityAt = Date.now();
           S.lastActivityKind = 'ASYNC';
@@ -743,6 +820,21 @@
       };
     }
 
+    if (isWebSearchMessage(m) && (m.recipient === 'web.run' || m.author?.name === 'web.run')) {
+      const web = webSearchData(m);
+      const detail = web.queries.length
+        ? `${web.queries.length} ${web.queries.length === 1 ? 'query' : 'queries'}`
+        : web.resultCount
+          ? `${web.resultCount} ${web.resultCount === 1 ? 'result' : 'results'}`
+          : (m.metadata?.reasoning_title || 'web search');
+      return {
+        kind: role === 'tool' ? 'WEB:RESULT' : 'WEB:SEARCH',
+        summary: detail,
+        css: 'tool',
+        meta: { messageId: m.id, webSearch: true },
+      };
+    }
+
     if (isToolMessage(m)) {
       return {
         kind: role === 'tool' ? 'TOOL:RESULT' : 'TOOL:CALL',
@@ -796,7 +888,7 @@
 
     for (const id of S.messageOrder) {
       const rec = S.messages.get(id);
-      if (!rec) continue;
+      if (!rec || !recordMatchesActiveConversation(rec)) continue;
 
       const m = rec.message;
       const role = m.author?.role || 'unknown';
@@ -815,6 +907,185 @@
 
     records.sort((a, b) => a.order - b.order);
     return records;
+  }
+
+  function isWebSearchMessage(m) {
+    if (!isObj(m)) return false;
+    const md = m.metadata || {};
+    return m.recipient === 'web.run' ||
+      m.author?.name === 'web.run' ||
+      md.tool_summary_type === 'web' ||
+      isObj(md.search_model_queries) ||
+      Array.isArray(md.search_result_groups) ||
+      Array.isArray(md.inline_cot_expandable_content?.search_result_groups);
+  }
+
+  function webSearchData(m) {
+    const md = m?.metadata || {};
+    const queries = [];
+    const querySeen = new Set();
+    const addQuery = value => {
+      if (typeof value !== 'string' || !value.trim()) return;
+      const q = value.trim();
+      if (!querySeen.has(q)) {
+        querySeen.add(q);
+        queries.push(q);
+      }
+    };
+    for (const q of md.search_model_queries?.queries || []) addQuery(q);
+
+    const groupsByDomain = new Map();
+    const entrySeen = new Set();
+    const addGroups = groups => {
+      if (!Array.isArray(groups)) return;
+      for (const group of groups) {
+        if (!isObj(group)) continue;
+        const domain = group.domain || 'Search results';
+        if (!groupsByDomain.has(domain)) groupsByDomain.set(domain, []);
+        const bucket = groupsByDomain.get(domain);
+        for (const entry of group.entries || []) {
+          if (!isObj(entry)) continue;
+          const ref = searchRefLabel(entry.ref_id);
+          const key = entry.url || `${entry.title || ''}|${ref}|${entry.snippet || ''}`;
+          if (entrySeen.has(key)) continue;
+          entrySeen.add(key);
+          bucket.push(entry);
+        }
+      }
+    };
+
+    addGroups(md.search_result_groups);
+    addGroups(md.inline_cot_expandable_content?.search_result_groups);
+    const groups = [...groupsByDomain.entries()]
+      .map(([domain, entries]) => ({ domain, entries }))
+      .filter(group => group.entries.length);
+
+    return {
+      queries,
+      groups,
+      resultCount: groups.reduce((sum, group) => sum + group.entries.length, 0),
+      title: md.reasoning_title || '',
+      sourceMessageIds: md.inline_cot_expandable_content?.source_message_ids || [],
+    };
+  }
+
+  function searchRefLabel(ref) {
+    if (!isObj(ref) || ref.turn_index == null || ref.ref_index == null) return '';
+    const type = ref.ref_type || 'search';
+    return `turn${ref.turn_index}${type}${ref.ref_index}`;
+  }
+
+  function safeExternalHref(value) {
+    try {
+      const url = new URL(String(value || ''), location.href);
+      return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+    } catch {
+      return '';
+    }
+  }
+
+  function renderWebSearchDetails(m, compact = false) {
+    const data = webSearchData(m);
+    const blocks = [];
+
+    if (data.queries.length) {
+      blocks.push(`
+        <div class="web-queries">
+          <div class="web-section-title">Queries · ${data.queries.length}</div>
+          ${data.queries.map(q => `<div class="web-query">${escapeHTML(q)}</div>`).join('')}
+        </div>`);
+    }
+
+    if (data.groups.length) {
+      blocks.push(`
+        <div class="web-results">
+          <div class="web-section-title">Results · ${data.resultCount} across ${data.groups.length} ${data.groups.length === 1 ? 'site' : 'sites'}</div>
+          ${data.groups.map((group, groupIndex) => `
+            <details class="web-group" ${!compact && data.groups.length <= 3 && groupIndex < 3 ? 'open' : ''}>
+              <summary>${escapeHTML(group.domain)} · ${group.entries.length}</summary>
+              <div class="web-result-list">
+                ${group.entries.map(entry => {
+                  const href = safeExternalHref(entry.url);
+                  const title = entry.title || entry.attribution || entry.url || '(untitled result)';
+                  const ref = searchRefLabel(entry.ref_id);
+                  return `<div class="web-result">
+                    <div class="web-result-title">${href ? `<a href="${escapeHTML(href)}" target="_blank" rel="noopener noreferrer">${escapeHTML(title)}</a>` : escapeHTML(title)}</div>
+                    <div class="web-result-meta">
+                      ${entry.attribution ? `<span>${escapeHTML(entry.attribution)}</span>` : ''}
+                      ${entry.pub_date ? `<span>${escapeHTML(entry.pub_date)}</span>` : ''}
+                      ${ref ? `<code>${escapeHTML(ref)}</code>` : ''}
+                    </div>
+                    ${entry.snippet ? `<div class="web-result-snippet">${escapeHTML(clip(entry.snippet, compact ? 260 : 600))}</div>` : ''}
+                  </div>`;
+                }).join('')}
+              </div>
+            </details>`).join('')}
+        </div>`);
+    }
+
+    if (!blocks.length && data.title) {
+      blocks.push(`<div class="web-empty">${escapeHTML(data.title)}</div>`);
+    }
+    return blocks.join('');
+  }
+
+  function renderWebSearchCard(rec) {
+    const m = rec.message;
+    const data = webSearchData(m);
+    const role = m.author?.role || '';
+    const isResult = role === 'tool';
+    const card = document.createElement('article');
+    card.className = `chat-card tool-card web-card ${isResult ? 'tool-result' : 'tool-call'}`;
+    const state = toolResultState(m);
+    const heading = data.title || (data.queries.length ? `Searching ${data.queries.length} ${data.queries.length === 1 ? 'query' : 'queries'}` : 'Web search');
+    card.innerHTML = `
+      <div class="card-head">
+        <span class="role-chip web-chip">${isResult ? 'WEB RESULT' : 'WEB SEARCH'}</span>
+        <strong class="tool-name">${escapeHTML(heading)}</strong>
+        <span class="spacer"></span>
+        ${isResult && data.resultCount ? `<span class="dim">${data.resultCount} result${data.resultCount === 1 ? '' : 's'}</span>` : ''}
+        ${state.label ? `<span class="status-badge ${state.css || ''}">${escapeHTML(state.label)}</span>` : ''}
+      </div>
+      ${isResult ? renderWebSearchDetails(m) : (data.queries.length ? renderWebSearchDetails(m) : '')}
+      <div class="tool-meta">
+        ${m.recipient && m.recipient !== 'all' ? `<span>recipient <code>${escapeHTML(m.recipient)}</code></span>` : ''}
+        <span>id <code>${escapeHTML(shortID(m.id))}</code></span>
+      </div>
+      ${rawDetails(m)}
+    `;
+    return card;
+  }
+
+  function renderContentSources(m) {
+    const refs = Array.isArray(m?.metadata?.content_references) ? m.metadata.content_references : [];
+    const sources = [];
+    const seen = new Set();
+    const add = source => {
+      if (!isObj(source)) return;
+      const url = source.url || '';
+      const title = source.title || source.attribution || url;
+      const key = url || title;
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      const refs = Array.isArray(source.refs) ? source.refs.map(searchRefLabel).filter(Boolean) : [];
+      sources.push({ title, url, attribution: source.attribution, pub_date: source.pub_date, refs });
+      for (const supporting of source.supporting_websites || []) add(supporting);
+    };
+    for (const ref of refs) {
+      for (const item of ref.items || []) add(item);
+      for (const source of ref.sources || []) add(source);
+    }
+    if (!sources.length) return '';
+    return `<details class="source-details">
+      <summary>Sources · ${sources.length}</summary>
+      <div class="source-list">${sources.map(source => {
+        const href = safeExternalHref(source.url);
+        return `<div class="source-item">
+          ${href ? `<a href="${escapeHTML(href)}" target="_blank" rel="noopener noreferrer">${escapeHTML(source.title)}</a>` : `<strong>${escapeHTML(source.title)}</strong>`}
+          <div class="web-result-meta">${source.attribution ? `<span>${escapeHTML(source.attribution)}</span>` : ''}${source.pub_date ? `<span>${escapeHTML(source.pub_date)}</span>` : ''}${source.refs?.map(ref => `<code>${escapeHTML(ref)}</code>`).join('') || ''}</div>
+        </div>`;
+      }).join('')}</div>
+    </details>`;
   }
 
   function renderChatCard(rec) {
@@ -847,6 +1118,7 @@
               <div class="thought-state">${thought?.finished === false ? 'in progress' : 'finished'}</div>
             </div>`).join('') : '<div class="thinking-body">(empty thoughts payload)</div>'}
         </div>
+        ${renderWebSearchDetails(m, true)}
         ${rawDetails(m)}
       `;
       return card;
@@ -911,6 +1183,10 @@
         ${rawDetails(m)}
       `;
       return card;
+    }
+
+    if (isWebSearchMessage(m) && (m.recipient === 'web.run' || m.author?.name === 'web.run')) {
+      return renderWebSearchCard(rec);
     }
 
     if (isToolMessage(m)) {
@@ -986,6 +1262,7 @@
         ${status ? `<span class="status ${status === 'in_progress' ? 'live' : ''}">${escapeHTML(status)}</span>` : ''}
       </div>
       <div class="message-body">${renderText(text || contentFallback(m.content) || emptyText)}</div>
+      ${renderContentSources(m)}
       <div class="message-meta">
         <span>${formatTime(rec.firstSeen)}</span>
         <span>id <code>${escapeHTML(shortID(m.id))}</code></span>
@@ -1574,6 +1851,26 @@
         .tool-name { color:#e0fbe6; font-size:12px; }
         .tool-app { color:#9be4ae; font:700 9px ui-monospace,SFMono-Regular,monospace; padding:2px 5px; border-radius:5px; background:#193c22; }
         .tool-body { color:#e1eee4; font-size:11px; }
+        .web-card { background:#111923; border-color:#68a9ff4f; }
+        .web-chip { color:#cfe6ff; background:#193a5c; }
+        .web-queries, .web-results { padding:9px 10px; border-top:1px solid #ffffff14; }
+        .web-section-title { margin-bottom:7px; color:#b9d8ff; font-weight:700; font-size:10px; text-transform:uppercase; letter-spacing:.04em; }
+        .web-query { margin:5px 0; padding:7px 8px; border:1px solid #6caeff35; border-radius:7px; background:#0c121a; color:#dcecff; font:10px/1.45 ui-monospace,SFMono-Regular,monospace; overflow-wrap:anywhere; }
+        .web-group { margin:6px 0; border:1px solid #ffffff1b; border-radius:8px; overflow:hidden; background:#0c1118; }
+        .web-group summary { cursor:pointer; padding:7px 9px; color:#d2e7ff; font-weight:650; }
+        .web-result-list { display:grid; gap:1px; border-top:1px solid #ffffff12; }
+        .web-result { padding:8px 9px; background:#0d131b; }
+        .web-result + .web-result { border-top:1px solid #ffffff0d; }
+        .web-result-title a, .source-item a { color:#9dccff; text-decoration:none; }
+        .web-result-title a:hover, .source-item a:hover { text-decoration:underline; }
+        .web-result-meta { display:flex; flex-wrap:wrap; gap:7px; margin-top:3px; color:#9faeba; font-size:9px; }
+        .web-result-meta code { color:#c8d7e4; }
+        .web-result-snippet { margin-top:5px; color:#cbd5df; font-size:10px; line-height:1.45; }
+        .web-empty { padding:9px 10px; color:#cbd9e7; }
+        .source-details { margin:0 11px 9px; border:1px solid #6caeff2f; border-radius:8px; background:#0d1219; }
+        .source-details summary { cursor:pointer; padding:7px 9px; color:#bddcff; font-weight:650; }
+        .source-list { display:grid; gap:1px; border-top:1px solid #ffffff12; }
+        .source-item { padding:7px 9px; background:#0d131b; }
         .raw-details { border-color:#ffffff1c; }
         .raw-details summary { color:#b8b8c2; font-size:10px; }
         .raw-details pre, .event-raw { color:#d5d5dc; background:#060607; font-size:10px; }
@@ -1810,6 +2107,7 @@
     $('.export').onclick = exportSnapshot;
 
     installPanelMovement($('.topbar'));
+    installConversationRouteTracking();
     updateViewClass();
     scheduleRender();
   }
@@ -1894,6 +2192,27 @@
     }
   }
 
+  function installConversationRouteTracking() {
+    if (S.routeTrackingInstalled) return;
+    S.routeTrackingInstalled = true;
+
+    const sync = () => setActiveConversation(routeConversationId(), 'route');
+    const wrapHistory = method => {
+      const original = history?.[method];
+      if (typeof original !== 'function') return;
+      history[method] = function (...args) {
+        const result = original.apply(this, args);
+        queueMicrotask(sync);
+        return result;
+      };
+    };
+
+    wrapHistory('pushState');
+    wrapHistory('replaceState');
+    window.addEventListener('popstate', () => queueMicrotask(sync), { passive: true });
+    sync();
+  }
+
   function updateViewClass() {
     if (!S.panel) return;
     const body = S.root.querySelector('.body');
@@ -1907,11 +2226,13 @@
     const completedParents = new Set();
 
     for (const rec of S.messages.values()) {
+      if (!recordMatchesActiveConversation(rec)) continue;
       const m = rec.message;
       if (m?.author?.role === 'tool' && m.metadata?.parent_id) completedParents.add(m.metadata.parent_id);
     }
 
     for (const rec of S.messages.values()) {
+      if (!recordMatchesActiveConversation(rec)) continue;
       const m = rec.message;
       if (!m || m.author?.role !== 'assistant' || !isToolMessage(m)) continue;
       if (!m.recipient || m.recipient === 'all') continue;
@@ -1925,6 +2246,7 @@
     const pending = pendingToolCalls();
     const inProgress = [];
     for (const rec of S.messages.values()) {
+      if (!recordMatchesActiveConversation(rec)) continue;
       if (rec.message?.status === 'in_progress') inProgress.push(rec);
     }
 
@@ -2075,6 +2397,7 @@ ${detail}`;
   function exportSnapshot() {
     const snapshot = {
       exportedAt: new Date().toISOString(),
+      activeConversationId: S.activeConversationId,
       streamMeta: sanitize(S.streamMeta),
       events: S.events,
       reconstructedMessages: S.messageOrder
@@ -2115,8 +2438,12 @@ ${detail}`;
 
       // Rich reference tokens: show compact pills rather than enormous control glyphs.
       s = s.replace(
-        /([a-zA-Z_]+)[\s\S]*?/g,
-        (_, type) => `<span class="ref-pill">${escapeHTML(type)}</span>`
+        /([a-zA-Z_]+)([\s\S]*?)/g,
+        (_, type, payload) => {
+          const refs = String(payload || '').split('').filter(Boolean);
+          const detail = type === 'cite' && refs.length ? ` · ${refs.length} ref${refs.length === 1 ? '' : 's'}` : '';
+          return `<span class="ref-pill" title="${escapeHTML(String(payload || ''))}">${escapeHTML(type + detail)}</span>`;
+        }
       );
 
       s = s
@@ -2378,5 +2705,5 @@ ${detail}`;
     observer.observe(document, { childList: true, subtree: true });
   }
 
-  console.info('[ChatGPT Agent Stream Inspector] v0.4.1 installed');
+  console.info('[ChatGPT Agent Stream Inspector] v0.4.2 installed');
 })();

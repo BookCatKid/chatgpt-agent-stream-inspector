@@ -11,7 +11,8 @@ const marker = /^  console\.info\('\[ChatGPT Agent Stream Inspector\].*$/m;
 assert(marker.test(source), 'test hook marker not found');
 source = source.replace(marker, `  globalThis.__ASI_TEST__ = {
     S, processProtocolData, processWebSocketProtocol,
-    describeToolMessage, messageText, findImagePointers
+    describeToolMessage, messageText, findImagePointers,
+    chatRecords, webSearchData, isWebSearchMessage, classifyMessage
   };`);
 
 function makeRuntime() {
@@ -43,7 +44,7 @@ function replay(file) {
     const at = event.at || new Date().toISOString();
     const raw = event.raw;
     if (raw?.data !== undefined && String(raw.url || '').includes('/backend-api/f/conversation')) {
-      api.processProtocolData(raw.data, at);
+      api.processProtocolData(raw.data, at, raw.url || '');
     }
     if (String(event.kind || '').startsWith('WS:')) {
       api.processWebSocketProtocol(raw, at);
@@ -53,7 +54,10 @@ function replay(file) {
   return { capture, api };
 }
 function stats(api) {
-  const messages = [...api.S.messages.values()].map(x => x.message);
+  const records = [...api.S.messages.values()];
+  const messages = records.map(x => x.message);
+  const visibleRecords = api.chatRecords();
+  const visibleMessages = visibleRecords.map(x => x.message);
   const interrupted = messages.filter(m =>
     m?.metadata?.finish_details?.type === 'interrupted' ||
     m?.metadata?.finish_details?.reason === 'client_stopped'
@@ -65,7 +69,21 @@ function stats(api) {
     const info = api.describeToolMessage(m);
     return info.action && info.action !== 'call_tool' && info.label !== 'api_tool.call_tool';
   }).length;
-  return { messages, interrupted, images, thoughts, calls: calls.length, decodedCalls };
+  const visibleImages = visibleMessages.filter(m => api.findImagePointers(m).length).length;
+  const foreignImages = records.filter(rec =>
+    rec.conversationId && api.S.activeConversationId &&
+    rec.conversationId !== api.S.activeConversationId &&
+    api.findImagePointers(rec.message).length
+  ).length;
+  const visibleForeign = visibleRecords.filter(rec =>
+    rec.conversationId && api.S.activeConversationId && rec.conversationId !== api.S.activeConversationId
+  ).length;
+  const classifications = messages.map(m => api.classifyMessage(m));
+  const webClassifications = classifications.filter(x => x?.kind === 'WEB:SEARCH' || x?.kind === 'WEB:RESULT').length;
+  const web = visibleMessages.filter(api.isWebSearchMessage).map(api.webSearchData);
+  const webQueries = web.reduce((n, item) => n + item.queries.length, 0);
+  const webResults = web.reduce((n, item) => n + item.resultCount, 0);
+  return { messages, visibleMessages, classifications, webClassifications, interrupted, images, visibleImages, foreignImages, visibleForeign, thoughts, calls: calls.length, decodedCalls, webQueries, webResults };
 }
 
 const files = process.argv.slice(2);
@@ -86,11 +104,15 @@ for (const file of files) {
     if (rawText.includes('image_asset_pointer')) assert(s.images > 0, 'image result was not reconstructed');
     if (rawText.includes('"content_type": "thoughts"')) assert(s.thoughts > 0, 'thought summaries were not reconstructed');
     if (rawText.includes('api_tool.call_tool')) assert(s.decodedCalls > 0, 'tool calls remained entirely generic');
+    if (rawText.includes('search_model_queries')) assert(s.webQueries > 0, 'web search queries were not parsed');
+    if (rawText.includes('web.run')) assert(s.webClassifications > 0, 'web search messages were not classified');
+    if (rawText.includes('search_result_groups') && rawText.includes('web.run')) assert(s.webResults > 0, 'web search results were not parsed');
+    if (s.foreignImages > 0) assert.equal(s.visibleForeign, 0, 'foreign-conversation messages leaked into active chat');
 
     const previous = capture.reconstructedMessages?.length || 0;
     if (previous) assert(s.messages.length >= previous, `replay lost messages (${s.messages.length} < ${previous})`);
 
-    console.log(`PASS ${path.basename(file)} :: messages=${s.messages.length} tools=${s.calls}/${s.decodedCalls} images=${s.images} thoughts=${s.thoughts} interrupted=${s.interrupted}`);
+    console.log(`PASS ${path.basename(file)} :: messages=${s.messages.length} tools=${s.calls}/${s.decodedCalls} images=${s.images}/${s.visibleImages} web=${s.webQueries}q/${s.webResults}r thoughts=${s.thoughts} interrupted=${s.interrupted}`);
   } catch (error) {
     failed = true;
     console.error(`FAIL ${file}`);

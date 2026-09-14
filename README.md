@@ -64,6 +64,16 @@ Tool cards understand substantially more than the generic recipient name:
 
 Raw payloads remain expandable, so a prettier renderer does not discard the underlying message.
 
+### Web search
+
+`web.run` gets dedicated parsing instead of generic empty tool cards. The inspector renders captured `search_model_queries`, grouped `search_result_groups`, per-result titles/URLs/snippets/attribution/reference IDs, and the web-result groups attached to `thoughts.metadata.inline_cot_expandable_content`. Final assistant messages also expose structured sources from `content_references`.
+
+Search invocation cards, raw result batches, and user-facing “Searched N websites” summaries are kept distinct so the protocol lifecycle remains inspectable without turning every stage into the same giant result list.
+
+### Conversation scoping
+
+ChatGPT's `conversations` WebSocket is account-global and can deliver async updates for chats other than the one currently open. Every reconstructed message is therefore associated with its observed `conversation_id`; Network Chat and its activity indicator only use the active conversation. Foreign updates remain captured in Events/export data and are labeled as other-chat traffic instead of leaking into the visible chat timeline.
+
 ### Image generation
 
 Image generation is reconstructed from both the main stream and async WebSocket updates. Dedicated image cards expose observed fields such as title, intermediate/final state, dimensions, MIME type, byte size, `asset_pointer`, generation ID, orientation, transparency, and parent generation ID.
@@ -145,6 +155,15 @@ When changing reconstruction logic, test against captures covering ordinary stre
 - UI-only errors that never appear in captured traffic cannot be reconstructed from this network inspector alone.
 
 ## Version history
+
+### 0.4.2
+
+- Scope reconstructed messages and async WebSocket updates by `conversation_id` to prevent cross-chat image/tool leakage.
+- Foreign-conversation WebSocket traffic stays available in Events/export but no longer affects the active chat or health indicator.
+- Dedicated `web.run` query/result rendering, including grouped search results and reference IDs.
+- Web-result groups attached to browser-visible `thoughts` summaries are parsed.
+- Final response `content_references` now produce an expandable structured Sources section.
+- Citation pills preserve a compact reference count instead of collapsing every citation to the word `cite`.
 
 ### 0.4.1
 
