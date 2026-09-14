@@ -1,113 +1,159 @@
 # ChatGPT Agent Stream Inspector
 
-A power-user userscript that passively inspects ChatGPT's live browser protocol and reconstructs what the client is receiving into two views:
+A power-user userscript that passively taps ChatGPT's browser protocol and reconstructs what the web client is receiving in real time.
 
-- **Network Chat** — user messages, assistant messages, reasoning recaps, tool calls/results, Python output, image results, and hidden/internal protocol messages.
-- **Events** — the underlying SSE/WebSocket traffic, with a focused mode that hides transport noise by default.
+It provides two complementary views:
 
-The inspector does **not** scrape ChatGPT's rendered DOM to build the chat view. It reconstructs the conversation from the same network stream the web client receives.
+- **Network Chat** — user/assistant messages, work summaries, tool calls/results, image generation, Python output, interruptions, hidden system/context messages, and other browser-received message types.
+- **Events** — the underlying SSE and WebSocket traffic, with both a readable **Focused** mode and an **Everything** firehose.
+
+The Network Chat view is built from network traffic. It does **not** scrape ChatGPT's rendered conversation DOM.
 
 > Unofficial project. Not affiliated with or endorsed by OpenAI.
-
-## Features
-
-- Passive `fetch()` interception using `Response.clone()`; ChatGPT receives the untouched original response.
-- SSE parsing for `/backend-api/f/conversation` and observed secondary streams.
-- ChatGPT `v1` delta reconstruction, including `add`, `append`, `replace`, `remove`, `truncate`, patch batches, and inherited/shorthand patch frames.
-- WebSocket inspection and reconciliation from full conversation-update snapshots.
-- Tool-call and tool-result cards for built-in tools, MCP/connectors, and plugins.
-- Reasoning recap/status cards when the server actually sends them to the browser.
-- Python/data-analysis and generated-image result handling.
-- **Show internal is enabled by default**, exposing hidden system/context/tool-plumbing messages that the normal UI suppresses.
-- Focused vs. Everything event modes.
-- Split / Chat-only / Events-only layouts.
-- Expandable sanitized raw payloads.
-- JSON export for protocol research.
-- Redaction of obvious bearer tokens, cookies, resume tokens, signed/verification query parameters, and similar credentials from displayed/exported payloads.
 
 ## Install
 
 1. Install a userscript manager such as Tampermonkey or Violentmonkey.
 2. Create a new userscript.
-3. Replace its contents with [`chatgpt-agent-stream-inspector.user.js`](./chatgpt-agent-stream-inspector.user.js).
+3. Copy in [`chatgpt-agent-stream-inspector.user.js`](./chatgpt-agent-stream-inspector.user.js).
 4. Save it and fully refresh `https://chatgpt.com/`.
 5. Click the **AGT** button in the bottom-right corner.
 
-The script runs at `document-start` so it can hook `fetch` and `WebSocket` before ChatGPT begins a turn.
+The script runs at `document-start` so it can install its `fetch` and `WebSocket` taps before a turn starts.
 
-## Views
+## What v0.4 understands
 
-### Network Chat
+### Conversation streaming
+- `/backend-api/f/conversation` SSE streams
+- ChatGPT `v1` delta state
+- `add`, `append`, `replace`, `remove`, `truncate`, and `patch`
+- shorthand/inherited v1 operations such as `{v: ...}` after an earlier `{o: "patch"}`
+- full-message WebSocket reconciliation
+- both singular `update_content.message` and plural `update_content.messages[]`
+- message markers and completion metadata
+- user interruptions via `finish_details.type = "interrupted"` / `reason = "client_stopped"`
 
-This is a reconstructed developer-oriented version of the conversation. It can show things the normal ChatGPT UI intentionally hides, including internal system/context messages and tool plumbing.
+### Messages and working state
 
-**Show internal is on by default.** Turn it off if you want the reconstructed pane to look closer to the normal user-visible conversation.
+The chat pane has first-class renderers for:
 
-“Internal” does **not** mean private model chain-of-thought. The inspector can only display information that was actually transmitted to the browser.
+- user and assistant text
+- commentary/work-update messages
+- `reasoning_recap`
+- structured `thoughts` summaries
+- `reasoning_title` status text
+- system/rebase/context messages
+- `model_editable_context`
+- unknown message content, with a structured fallback instead of silently dropping it
 
-### Events
+**Show internal is enabled by default.** Internal means protocol messages that ChatGPT marks as hidden from the ordinary conversation UI. It does not mean private model chain-of-thought that was never transmitted to the browser.
 
-**Focused** hides low-value transport clutter such as handshakes, resume tokens, markers, duplicate input records, and raw token patch spam while keeping messages, thinking summaries, tools, Python/image results, and errors.
+### Tools and connectors
+Tool cards understand substantially more than the generic recipient name:
 
-**Everything** exposes the full captured firehose.
+- `api_tool.call_tool` paths
+- connector/app name + action extraction
+- `api_tool.list_resources`
+- structured arguments and results
+- terminal output, exit code, runtime, and chunk IDs
+- permission/confirmation payloads
+- blocked and error states
+- connector attachments
+- tool result pairing and approximate latency
+- opaque internal tool IDs, while still exposing the raw recipient in metadata
 
-## How it works
+Raw payloads remain expandable, so a prettier renderer does not discard the underlying message.
+
+### Image generation
+
+Image generation is reconstructed from both the main stream and async WebSocket updates. Dedicated image cards expose observed fields such as title, intermediate/final state, dimensions, MIME type, byte size, `asset_pointer`, generation ID, orientation, transparency, and parent generation ID.
+
+Some image results include a huge `Model caption:` string. v0.4 preserves it but puts it in a collapsed section instead of letting it dominate the timeline.
+
+If ChatGPT only supplies a `sediment://` asset pointer and no browser-loadable URL, the inspector does not invent a preview URL.
+
+### Activity / stuck indicator
+
+The header separately tracks **activity** (meaningful protocol work) and **net** (any captured network traffic), so keepalives do not look like useful progress while streamed text still resets the activity clock.
+Example states:
+
+```text
+WORKING · activity now · net now · GitHub · get_profile
+WAITING · activity 18s · net 2s · Chat On Steroids Core · exec_command
+STALLED? · activity 37s · net 31s
+IDLE · activity 2m 4s · net 9s
+```
+
+## Focused vs Everything
+
+**Focused** de-emphasizes low-value event-log noise such as handshakes, keepalives, raw patch spam, duplicate input records, resume-token bookkeeping, and markers.
+
+It does not delete those packets. Switch Events to **Everything**, expand raw records, or export the snapshot to inspect them.
+
+The reconstructed chat is intentionally much less lossy: recognized content gets a dedicated renderer and unknown content falls back to structured/raw display.
+
+## Architecture
 
 ```text
 ChatGPT web app
       |
-      | fetch('/backend-api/f/conversation')
-      v
-userscript fetch hook
+      +---- fetch/SSE ----> v1 state reducer ----> Events + Network Chat
       |
-      +---- original Response ----------------> ChatGPT
-      |
-      +---- response.clone()
-                |
-                v
-          SSE v1 decoder
-                |
-                +---- event log
-                |
-                +---- reconstructed message state
-                            |
-                            v
-                       Network Chat
-
-WebSocket traffic ----------------------------> inspector
-                |
-                +---- full-message reconciliation
+      +---- WebSocket ----> async/reconciliation -> Events + Network Chat
 ```
 
-A key detail is that ChatGPT's stream is not just token text. Later packets can patch previously created message objects and metadata, and some `v1` packets inherit the previous operation instead of repeating it. The inspector maintains message state rather than treating each frame independently.
-
+A message can be created empty, filled by later patches, have metadata appended after text starts, and finally be reconciled by a complete WebSocket snapshot.
 ## Privacy and safety
 
-This script is designed as a **local passive inspector**. It does not intentionally send captured traffic anywhere.
+This is designed as a **local passive inspector**. It does not intentionally send captured traffic anywhere, modify ChatGPT requests, or replace ChatGPT responses. The fetch hook reads a cloned `Response`; the original response is returned to ChatGPT.
 
-Still, network payloads can contain sensitive conversation data and account/session metadata. Treat exported inspector JSON like a HAR file: review it before sharing publicly.
+The display/export sanitizer redacts common credential shapes such as bearer values, cookies, access/refresh tokens, resume tokens, and verification/signature/auth-like URL parameters. That is defense in depth, not a guarantee: exported inspector JSON can still contain private conversation/account metadata, so treat it like a HAR file.
 
-The built-in sanitizer redacts obvious credential fields, but no generic redactor can guarantee that every future secret shape will be recognized.
+## What it cannot show
 
-## Known limitations
-
-- ChatGPT's private web protocol is undocumented and can change without notice.
-- Some rich UI types are displayed generically rather than perfectly recreating ChatGPT's own renderer.
-- `truncate` support is conservative because only limited observed shapes have been captured so far.
-- Binary WebSocket frames are reported by type/size rather than decoded.
-- The inspector cannot reveal information that never reaches the browser.
+The inspector can only show information that reaches the browser. It can display browser-visible work summaries, reasoning recaps, `thoughts` summaries, status titles, tool activity, and hidden protocol messages. It cannot reveal private model reasoning that the server never transmitted.
 
 ## Development
 
-There is no build step. The project is intentionally a single userscript so it is easy to audit and install.
-
-Syntax check:
+There is no build step. The project is deliberately kept as a single auditable userscript.
 
 ```bash
 node --check chatgpt-agent-stream-inspector.user.js
+git diff --check
+
+# Replay one or more local inspector exports (captures are not committed)
+node tests/replay-captures.mjs /path/to/capture.json [/path/to/another.json ...]
 ```
 
-When changing protocol reconstruction, the safest workflow is to replay sanitized exported captures and verify that the reconstructed final message matches the authoritative completed message received by ChatGPT.
+Captured inspector exports are intentionally excluded from the repository because they may contain private conversations or session/account metadata.
+
+When changing reconstruction logic, test against captures covering ordinary streaming, shorthand v1 patches, a tool-heavy agent turn, image generation with async WebSocket updates, and a user-stopped generation.
+
+## Known limitations
+- ChatGPT's private web protocol is undocumented and can change at any time.
+- Some rich content-reference/widget types still use generic/raw display rather than recreating ChatGPT's exact UI.
+- `truncate` support remains conservative because only limited observed variants have been captured.
+- Binary WebSocket frames are shown by type/size rather than decoded.
+- A `sediment://` image pointer is not automatically a browser-loadable image URL.
+- UI-only errors that never appear in captured traffic cannot be reconstructed from this network inspector alone.
+
+## Version history
+
+### 0.4.0
+
+- Major contrast/readability pass.
+- Structured work/thinking summaries and reasoning titles.
+- Much richer tool and connector parsing.
+- Async `messages[]` WebSocket ingestion.
+- Dedicated image-generation cards and collapsed model captions.
+- User interruption detection.
+- Live activity/network age indicator.
+- Internal messages remain visible by default.
+- Unknown payloads keep structured/raw fallbacks rather than disappearing.
+
+### 0.3.x
+
+Initial reconstructed Network Chat, stateful v1 patch application, WebSocket full-message reconciliation, and Focused/Everything event views.
 
 ## License
 
